@@ -20,8 +20,14 @@ import sys
 import tempfile
 import threading
 import time
-import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+try:
+    import tkinter as tk
+    from tkinter import filedialog, messagebox, ttk
+except ImportError:
+    tk = None
+    filedialog = None
+    messagebox = None
+    ttk = None
 
 
 # ---------------------------------------------------------------------------
@@ -2383,6 +2389,8 @@ class Studio:
 
 def creer_fenetre() -> tk.Tk:
     """Construit la fenêtre, sans encore entrer dans la boucle d'événements."""
+    if tk is None:
+        raise SystemExit("Tkinter est introuvable. La fenêtre ne peut pas s'ouvrir.")
     root = tk.Tk()
     root.withdraw()
     Studio(root)

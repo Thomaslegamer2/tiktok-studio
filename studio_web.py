@@ -22,7 +22,20 @@ if RACINE not in sys.path:
 
 import tiktok_studio as studio  # noqa: E402
 
-PORT = 8765
+
+def lire_port() -> int:
+    """Le port du service. L'hébergeur peut l'imposer avec la variable PORT."""
+    brut = os.environ.get("PORT", "8765")
+    try:
+        port = int(brut)
+    except ValueError:
+        return 8765
+    if not 1 <= port <= 65535:
+        return 8765
+    return port
+
+
+PORT = lire_port()
 PAGE = os.path.join(RACINE, "studio_mobile.html")
 TAILLE_CLIP_MAX = 800 * 1024 * 1024
 EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi", ".m4v", ".webm", ".3gp"}
