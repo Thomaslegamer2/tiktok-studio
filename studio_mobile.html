@@ -605,8 +605,12 @@
       peindreThemes();
       peindreLangue();
       if (donnees.travail) {
-        const fiche = await lireJson(await fetch("/api/montage/" + donnees.travail));
-        if (fiche.etat === "encodage") suivre(donnees.travail);
+        try {
+          const fiche = await lireJson(await fetch("/api/montage/" + donnees.travail));
+          if (fiche.etat === "encodage") suivre(donnees.travail);
+        } catch (exc) {
+          /* un ancien numéro de montage ne doit pas bloquer la page */
+        }
       }
     }
 
@@ -682,8 +686,42 @@
     }
 
     async function suivre(id) {
+      if (!id) {
+        throw new Error("Le serveur n'a pas renvoyé le montage.");
+      }
+      let essais = 0;
+      const abandon = (message) => {
+        montrerErreur(message);
+        $("creer").disabled = false;
+        $("creer").textContent = "Créer le montage";
+        etat.enCours = false;
+      };
       const attente = async () => {
-        const donnees = await lireJson(await fetch("/api/montage/" + id));
+        let reponse;
+        try {
+          reponse = await fetch("/api/montage/" + id);
+        } catch (exc) {
+          if (essais < 8) {
+            essais += 1;
+            setTimeout(attente, 900);
+            return;
+          }
+          abandon(exc.message);
+          return;
+        }
+        if (reponse.status === 404 && essais < 8) {
+          essais += 1;
+          setTimeout(attente, 900);
+          return;
+        }
+        let donnees;
+        try {
+          donnees = await lireJson(reponse);
+        } catch (exc) {
+          abandon(exc.message);
+          return;
+        }
+        essais = 0;
         $("statut").textContent = donnees.message || "Montage en cours…";
         if (donnees.etat === "pret") {
           const url = "/api/video/" + id;

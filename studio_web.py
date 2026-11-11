@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import tempfile
 import threading
 import traceback
 import uuid
@@ -46,16 +47,111 @@ _travaux: dict[str, dict] = {}
 _phrases_vues: set[str] = set()
 _dernier_travail = ""
 _depot = ""
-_temporaire = None
+
+
+def dossier_donnees() -> str:
+    """Dossier stable : un redémarrage ne doit pas effacer le montage terminé."""
+    base = os.environ.get("STUDIO_DATA") or os.path.join(os.path.expanduser("~"), ".tiktok-studio")
+    try:
+        os.makedirs(base, exist_ok=True)
+        return base
+    except OSError:
+        secours = os.path.join(tempfile.gettempdir(), "tiktok-studio")
+        os.makedirs(secours, exist_ok=True)
+        return secours
 
 
 def preparer_depot() -> str:
-    """Dossier temporaire des clips envoyés par le téléphone. Il reste ouvert."""
-    global _depot, _temporaire
-    if _temporaire is None:
-        _temporaire = studio.dossier_temporaire()
-        _depot = _temporaire.__enter__()
+    """Dossier des clips envoyés. Il reste en place après la fin du montage."""
+    global _depot
+    if _depot and os.path.isdir(_depot):
+        return _depot
+    _depot = os.path.join(dossier_donnees(), "clips")
+    os.makedirs(_depot, exist_ok=True)
     return _depot
+
+
+def identifiant_sur(valeur: str) -> str:
+    """Garde seulement un identifiant hexadécimal, pour le nom du fichier."""
+    propre = valeur.strip().strip("/").lower()
+    if not propre or len(propre) > 64:
+        return ""
+    if any(caractere not in "0123456789abcdef" for caractere in propre):
+        return ""
+    return propre
+
+
+def chemin_travail(identifiant: str) -> str:
+    dossier = os.path.join(dossier_donnees(), "travaux")
+    os.makedirs(dossier, exist_ok=True)
+    return os.path.join(dossier, identifiant + ".json")
+
+
+def ecrire_travail(identifiant: str, fiche: dict) -> None:
+    """Écrit l'état du montage tout de suite, pas seulement en mémoire."""
+    identifiant = identifiant_sur(identifiant)
+    if not identifiant:
+        return
+    chemin = chemin_travail(identifiant)
+    temporaire = chemin + ".tmp"
+    with open(temporaire, "w", encoding="utf-8") as fichier:
+        json.dump(fiche, fichier, ensure_ascii=False)
+    os.replace(temporaire, chemin)
+
+
+def lire_travail(identifiant: str) -> dict | None:
+    identifiant = identifiant_sur(identifiant)
+    if not identifiant:
+        return None
+    chemin = chemin_travail(identifiant)
+    try:
+        with open(chemin, encoding="utf-8") as fichier:
+            fiche = json.load(fichier)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(fiche, dict):
+        return None
+    return fiche
+
+
+def memoriser_travail(identifiant: str, **champs) -> None:
+    with _verrou:
+        fiche = _travaux.get(identifiant)
+        if fiche is None:
+            return
+        fiche.update(champs)
+        copie = dict(fiche)
+    ecrire_travail(identifiant, copie)
+
+
+def obtenir_travail(identifiant: str) -> dict | None:
+    """Lit le montage en mémoire, puis sur le disque si le processus a redémarré."""
+    identifiant = identifiant_sur(identifiant)
+    if not identifiant:
+        return None
+    with _verrou:
+        fiche = _travaux.get(identifiant)
+        if fiche is not None:
+            return dict(fiche)
+    return lire_travail(identifiant)
+
+
+def interrompre_orphelins() -> None:
+    """Un encodage encore marqué en cours au démarrage n'a plus de thread."""
+    dossier = os.path.join(dossier_donnees(), "travaux")
+    if not os.path.isdir(dossier):
+        return
+    for nom in os.listdir(dossier):
+        if not nom.endswith(".json"):
+            continue
+        identifiant = nom[:-5]
+        fiche = lire_travail(identifiant)
+        if not fiche or fiche.get("etat") != "encodage":
+            continue
+        fiche["etat"] = "erreur"
+        fiche["erreur"] = "Le montage a été interrompu. Relance la création."
+        fiche["message"] = "Le montage a été interrompu."
+        ecrire_travail(identifiant, fiche)
 
 
 def adresse_locale() -> str:
@@ -183,6 +279,8 @@ class SiteStudio(BaseHTTPRequestHandler):
         try:
             if chemin in ("/", "/index.html"):
                 self._page()
+            elif chemin in ("/health", "/healthz"):
+                self._json(200, {"ok": True})
             elif chemin == "/api/etat":
                 self._json(200, etat_public())
             elif chemin.startswith("/api/montage/"):
@@ -204,7 +302,7 @@ class SiteStudio(BaseHTTPRequestHandler):
                 self._recevoir_clip()
             elif chemin == "/api/phrases":
                 self._phrases()
-            elif chemin == "/api/montage":
+            elif chemin.rstrip("/") == "/api/montage":
                 self._lancer()
             else:
                 self._erreur(404, "Action introuvable.")
@@ -318,13 +416,15 @@ class SiteStudio(BaseHTTPRequestHandler):
         with _verrou:
             _travaux[travail] = fiche
             _dernier_travail = travail
+            copie = dict(fiche)
+        ecrire_travail(travail, copie)
         threading.Thread(
             target=self._encoder,
             args=(travail, chemins, phrases, duree, couper, theme_image, theme_texte, filigrane),
             daemon=True,
             name="montage-web",
         ).start()
-        self._json(202, {"id": travail})
+        self._json(200, {"id": travail})
 
     def _encoder(
         self,
@@ -338,9 +438,7 @@ class SiteStudio(BaseHTTPRequestHandler):
         filigrane: str,
     ) -> None:
         def maj(message: str) -> None:
-            with _verrou:
-                if travail in _travaux:
-                    _travaux[travail]["message"] = message
+            memoriser_travail(travail, message=message)
 
         try:
             ffmpeg = studio.trouver_executable("ffmpeg") or ""
@@ -359,39 +457,38 @@ class SiteStudio(BaseHTTPRequestHandler):
             )
             if not dans_depot(sortie):
                 raise studio.ErreurMontage("La vidéo a été écrite hors du dossier de travail.")
-            with _verrou:
-                _travaux[travail]["etat"] = "pret"
-                _travaux[travail]["video"] = sortie
-                _travaux[travail]["nom"] = os.path.basename(sortie)
-                _travaux[travail]["message"] = "Montage prêt."
+            memoriser_travail(
+                travail,
+                etat="pret",
+                video=sortie,
+                nom=os.path.basename(sortie),
+                message="Montage prêt.",
+            )
         except Exception as exc:
             texte = str(exc) if isinstance(exc, studio.ErreurMontage) else "Le montage n'a pas pu être créé.\n\n" + str(exc)
-            with _verrou:
-                _travaux[travail]["etat"] = "erreur"
-                _travaux[travail]["erreur"] = texte
-                _travaux[travail]["message"] = "Le montage n'a pas pu être créé."
+            memoriser_travail(
+                travail,
+                etat="erreur",
+                erreur=texte,
+                message="Le montage n'a pas pu être créé.",
+            )
 
     def _suivi(self, identifiant: str) -> None:
-        identifiant = identifiant.strip("/")
-        with _verrou:
-            fiche = _travaux.get(identifiant)
-            if not fiche:
-                self._erreur(404, "Montage introuvable.")
-                return
-            copie = {
-                "etat": fiche["etat"],
-                "message": fiche["message"],
-                "nom": fiche["nom"],
-                "erreur": fiche["erreur"],
-            }
-        self._json(200, copie)
+        fiche = obtenir_travail(identifiant)
+        if not fiche:
+            self._erreur(404, "Montage introuvable.")
+            return
+        self._json(200, {
+            "etat": fiche.get("etat", ""),
+            "message": fiche.get("message", ""),
+            "nom": fiche.get("nom", ""),
+            "erreur": fiche.get("erreur", ""),
+        })
 
     def _video(self, identifiant: str) -> None:
-        identifiant = identifiant.strip("/")
-        with _verrou:
-            fiche = _travaux.get(identifiant)
-            chemin = fiche["video"] if fiche else ""
-            nom = fiche["nom"] if fiche else ""
+        fiche = obtenir_travail(identifiant)
+        chemin = fiche.get("video", "") if fiche else ""
+        nom = fiche.get("nom", "") if fiche else ""
         if not chemin or not os.path.isfile(chemin) or not dans_depot(chemin):
             self._erreur(404, "La vidéo n'est pas encore prête.")
             return
@@ -440,6 +537,7 @@ def ouvrir_parefeu(port: int) -> None:
 
 def servir() -> None:
     preparer_depot()
+    interrompre_orphelins()
     ouvrir_parefeu(PORT)
     serveur = ThreadingHTTPServer(("0.0.0.0", PORT), SiteStudio)
     locale = adresse_locale()
