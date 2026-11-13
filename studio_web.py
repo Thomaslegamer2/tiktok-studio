@@ -92,11 +92,14 @@ def ecrire_travail(identifiant: str, fiche: dict) -> None:
     identifiant = identifiant_sur(identifiant)
     if not identifiant:
         return
-    chemin = chemin_travail(identifiant)
-    temporaire = chemin + ".tmp"
-    with open(temporaire, "w", encoding="utf-8") as fichier:
-        json.dump(fiche, fichier, ensure_ascii=False)
-    os.replace(temporaire, chemin)
+    try:
+        chemin = chemin_travail(identifiant)
+        temporaire = chemin + ".tmp"
+        with open(temporaire, "w", encoding="utf-8") as fichier:
+            json.dump(fiche, fichier, ensure_ascii=False)
+        os.replace(temporaire, chemin)
+    except OSError:
+        return
 
 
 def lire_travail(identifiant: str) -> dict | None:
@@ -134,6 +137,57 @@ def obtenir_travail(identifiant: str) -> dict | None:
         if fiche is not None:
             return dict(fiche)
     return lire_travail(identifiant)
+
+
+def chemin_fiche_clip(identifiant: str) -> str:
+    dossier = os.path.join(dossier_donnees(), "fiches")
+    os.makedirs(dossier, exist_ok=True)
+    return os.path.join(dossier, identifiant + ".json")
+
+
+def enregistrer_clip(identifiant: str, nom: str, chemin: str) -> None:
+    """Garde le lien entre l'identifiant et le fichier, même après un redémarrage."""
+    fiche = {"nom": nom, "chemin": chemin}
+    with _verrou:
+        _clips[identifiant] = fiche
+    identifiant = identifiant_sur(identifiant)
+    if not identifiant:
+        return
+    try:
+        destination = chemin_fiche_clip(identifiant)
+        temporaire = destination + ".tmp"
+        with open(temporaire, "w", encoding="utf-8") as fichier:
+            json.dump(fiche, fichier, ensure_ascii=False)
+        os.replace(temporaire, destination)
+    except OSError:
+        return
+
+
+def retrouver_clip(identifiant: str) -> dict | None:
+    """Retrouve une vidéo envoyée, en mémoire puis sur le disque."""
+    propre = identifiant_sur(str(identifiant))
+    if not propre:
+        return None
+    with _verrou:
+        fiche = _clips.get(propre)
+        if fiche is not None:
+            copie = dict(fiche)
+        else:
+            copie = None
+    if copie is None:
+        try:
+            with open(chemin_fiche_clip(propre), encoding="utf-8") as fichier:
+                lu = json.load(fichier)
+        except (OSError, json.JSONDecodeError):
+            return None
+        if not isinstance(lu, dict) or not lu.get("chemin"):
+            return None
+        copie = {"nom": str(lu.get("nom", "")), "chemin": str(lu["chemin"])}
+        with _verrou:
+            _clips[propre] = copie
+    if not os.path.isfile(copie["chemin"]):
+        return None
+    return copie
 
 
 def interrompre_orphelins() -> None:
@@ -292,8 +346,7 @@ class SiteStudio(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             return
         except Exception as exc:
-            traceback.print_exc()
-            self._erreur(500, str(exc))
+            self._signaler(chemin, exc)
 
     def do_POST(self) -> None:
         chemin = urlparse(self.path).path
@@ -313,8 +366,22 @@ class SiteStudio(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             return
         except Exception as exc:
-            traceback.print_exc()
-            self._erreur(500, str(exc))
+            self._signaler(chemin, exc)
+
+    def _signaler(self, chemin: str, exc: Exception) -> None:
+        """Affiche l'erreur dans les logs et la renvoie en JSON, jamais en page HTML."""
+        print(f"ERREUR {chemin} : {exc}", flush=True)
+        traceback.print_exc()
+        try:
+            self._erreur(500, str(exc) or "La demande a échoué.")
+        except Exception:
+            return
+
+    def send_error(self, code: int = 500, message: str | None = None, explain: str | None = None) -> None:
+        try:
+            self._erreur(int(code), message or "La demande a échoué.")
+        except Exception:
+            return
 
     def _page(self) -> None:
         try:
@@ -362,8 +429,7 @@ class SiteStudio(BaseHTTPRequestHandler):
         if reste > 0 or not os.path.isfile(chemin) or os.path.getsize(chemin) == 0:
             studio.supprimer_fichier(chemin)
             raise ValueError("La vidéo n'a pas été reçue en entier.")
-        with _verrou:
-            _clips[identifiant] = {"nom": nom, "chemin": chemin}
+        enregistrer_clip(identifiant, nom, chemin)
         self._json(200, {"id": identifiant, "nom": nom})
 
     def _lancer(self) -> None:
@@ -374,9 +440,14 @@ class SiteStudio(BaseHTTPRequestHandler):
             raise ValueError("Ajoute au moins une vidéo.")
         if len(identifiants) > 20:
             raise ValueError("Vingt vidéos maximum par montage.")
-        with _verrou:
-            manquants = [cle for cle in identifiants if cle not in _clips]
-            chemins = [_clips[cle]["chemin"] for cle in identifiants if cle in _clips]
+        manquants = []
+        chemins = []
+        for cle in identifiants:
+            fiche = retrouver_clip(str(cle))
+            if fiche is None:
+                manquants.append(cle)
+            else:
+                chemins.append(fiche["chemin"])
         if manquants or len(chemins) != len(identifiants):
             raise ValueError("Une vidéo n'est plus disponible. Ajoute-la de nouveau.")
 

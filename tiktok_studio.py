@@ -23,7 +23,7 @@ import time
 try:
     import tkinter as tk
     from tkinter import filedialog, messagebox, ttk
-except ImportError:
+except Exception:
     tk = None
     filedialog = None
     messagebox = None

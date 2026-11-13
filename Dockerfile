@@ -7,5 +7,6 @@ RUN apt-get update \
 WORKDIR /app
 COPY tiktok_studio.py studio_web.py studio_mobile.html ./
 
+ENV STUDIO_DATA=/tmp/tiktok-studio
 EXPOSE 8765
 CMD ["python", "-u", "studio_web.py"]

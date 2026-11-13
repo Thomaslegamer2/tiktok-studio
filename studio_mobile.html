@@ -586,8 +586,16 @@
     }
 
     async function lireJson(reponse) {
-      const donnees = await reponse.json().catch(() => ({}));
-      if (!reponse.ok) throw new Error(donnees.erreur || "La demande a échoué.");
+      const texte = await reponse.text();
+      let donnees = {};
+      try {
+        donnees = texte ? JSON.parse(texte) : {};
+      } catch (exc) {
+        donnees = {};
+      }
+      if (!reponse.ok) {
+        throw new Error(donnees.erreur || "La demande a échoué (" + reponse.status + ").");
+      }
       return donnees;
     }
 
