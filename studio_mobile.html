@@ -270,6 +270,10 @@
       min-height: 46px;
     }
     .ajout {
+      position: relative;
+      display: flex;
+      align-items: center;
+      justify-content: center;
       width: 100%;
       margin-top: 12px;
       color: var(--texte);
@@ -277,7 +281,14 @@
       background: transparent;
       box-shadow: inset 0 0 0 1px rgba(240, 208, 112, 0.45);
     }
-    input[type="file"] { display: none; }
+    #fichiers {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      opacity: 0;
+      font-size: 16px;
+    }
     textarea, input[type="text"] {
       width: 100%;
       margin-top: 12px;
@@ -394,8 +405,10 @@
     <h2>Tes vidéos</h2>
     <p class="aide">Dans l'ordre du montage. La première donne son nom au fichier, avec new devant.</p>
     <ul class="liste" id="liste"></ul>
-    <button class="ajout" type="button" id="ajouter">Ajouter des vidéos</button>
-    <input id="fichiers" type="file" accept="video/*" multiple>
+    <label class="ajout">
+      Ajouter des vidéos
+      <input id="fichiers" type="file" accept="video/*,.mp4,.mov,.mkv,.m4v,.webm" multiple>
+    </label>
   </section>
 
   <section class="etape" data-etape="1" data-nom="Filigrane">
@@ -622,13 +635,23 @@
       }
     }
 
-    $("ajouter").addEventListener("click", () => $("fichiers").click());
+    function nouvelId() {
+      if (window.crypto && typeof crypto.randomUUID === "function") return crypto.randomUUID();
+      return Date.now().toString(16) + Math.random().toString(16).slice(2);
+    }
+
     $("fichiers").addEventListener("change", () => {
-      [...$("fichiers").files].forEach((fichier) => {
-        etat.clips.push({ cle: crypto.randomUUID(), nom: fichier.name, fichier });
+      const choisis = [...$("fichiers").files];
+      if (!choisis.length) return;
+      choisis.forEach((fichier) => {
+        etat.clips.push({ cle: nouvelId(), nom: fichier.name, fichier });
       });
       $("fichiers").value = "";
       dessinerClips();
+      montrerEtape(0, false);
+      $("statut").textContent = choisis.length > 1
+        ? choisis.length + " vidéos ajoutées."
+        : "Vidéo ajoutée.";
     });
     $("filigrane").addEventListener("input", rafraichirApercu);
     $("phrases").addEventListener("input", rafraichirApercu);
