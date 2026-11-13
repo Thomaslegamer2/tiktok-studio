@@ -12,10 +12,11 @@ import os
 import sys
 import tempfile
 import threading
+import time
 import traceback
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 RACINE = os.path.dirname(os.path.abspath(__file__))
 if RACINE not in sys.path:
@@ -125,6 +126,37 @@ def memoriser_travail(identifiant: str, **champs) -> None:
         fiche.update(champs)
         copie = dict(fiche)
     ecrire_travail(identifiant, copie)
+
+
+def travail_recent() -> tuple[dict | None, str]:
+    """Le dernier montage de cette session, encore récent."""
+    with _verrou:
+        ident = _dernier_travail
+        fiche = _travaux.get(ident) if ident else None
+        if fiche is not None:
+            return dict(fiche), ident
+    dossier = os.path.join(dossier_donnees(), "travaux")
+    if not os.path.isdir(dossier):
+        return None, ""
+    maintenant = time.time()
+    candidats = []
+    for nom in os.listdir(dossier):
+        if not nom.endswith(".json"):
+            continue
+        chemin = os.path.join(dossier, nom)
+        try:
+            age = maintenant - os.path.getmtime(chemin)
+        except OSError:
+            continue
+        if age > 20 * 60:
+            continue
+        candidats.append((age, nom[:-5]))
+    candidats.sort()
+    for _age, ident in candidats:
+        fiche = lire_travail(ident)
+        if fiche:
+            return fiche, ident
+    return None, ""
 
 
 def obtenir_travail(identifiant: str) -> dict | None:
@@ -337,12 +369,14 @@ class SiteStudio(BaseHTTPRequestHandler):
                 self._json(200, {"ok": True})
             elif chemin == "/api/etat":
                 self._json(200, etat_public())
-            elif chemin.startswith("/api/montage/"):
-                self._suivi(chemin.removeprefix("/api/montage/"))
+            elif chemin.startswith("/api/montage"):
+                self._chemin_montage(chemin)
             elif chemin.startswith("/api/video/"):
                 self._video(chemin.removeprefix("/api/video/"))
             else:
                 self._erreur(404, "Page introuvable.")
+        except ValueError as exc:
+            self._erreur(400, str(exc))
         except (BrokenPipeError, ConnectionResetError):
             return
         except Exception as exc:
@@ -367,6 +401,48 @@ class SiteStudio(BaseHTTPRequestHandler):
             return
         except Exception as exc:
             self._signaler(chemin, exc)
+
+    def _chemin_montage(self, chemin: str) -> None:
+        """Ouvre un montage déjà lancé, ou le dernier de la session."""
+        reste = ""
+        if chemin.startswith("/api/montage/"):
+            reste = chemin[len("/api/montage/"):].strip("/")
+        if chemin.rstrip("/") == "/api/montage" or reste in ("", "dernier"):
+            if "clips" in parse_qs(urlparse(self.path).query):
+                self._lancer()
+                return
+            self._dernier()
+            return
+        self._suivi(reste)
+
+    def _parametres(self) -> dict:
+        """Lit le JSON, ou l'adresse si un proxy a transformé l'envoi en lecture."""
+        if self.command == "POST":
+            longueur = int(self.headers.get("Content-Length", "0") or "0")
+            if longueur > 0:
+                return lire_json(self)
+        query = parse_qs(urlparse(self.path).query, keep_blank_values=True)
+        if "clips" not in query:
+            raise ValueError("Ajoute au moins une vidéo.")
+
+        def un(cle: str, defaut: str = "") -> str:
+            valeurs = query.get(cle)
+            if not valeurs:
+                return defaut
+            return valeurs[0]
+
+        clips = [morceau for morceau in un("clips").split(",") if morceau]
+        phrases = un("phrases").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        couper = un("couper", "1") not in ("0", "false", "False")
+        return {
+            "clips": clips,
+            "phrases": phrases,
+            "duree": un("duree", "3"),
+            "couper": couper,
+            "theme_image": un("theme_image", "luxe"),
+            "theme_texte": un("theme_texte", "fin"),
+            "filigrane": un("filigrane", ""),
+        }
 
     def _signaler(self, chemin: str, exc: Exception) -> None:
         """Affiche l'erreur dans les logs et la renvoie en JSON, jamais en page HTML."""
@@ -434,7 +510,7 @@ class SiteStudio(BaseHTTPRequestHandler):
 
     def _lancer(self) -> None:
         global _dernier_travail
-        donnees = lire_json(self)
+        donnees = self._parametres()
         identifiants = donnees.get("clips")
         if not isinstance(identifiants, list) or not identifiants:
             raise ValueError("Ajoute au moins une vidéo.")
@@ -459,7 +535,11 @@ class SiteStudio(BaseHTTPRequestHandler):
             phrases.append("")
         phrases = phrases[: len(chemins)]
 
-        couper = bool(donnees.get("couper", True))
+        couper = donnees.get("couper", True)
+        if isinstance(couper, str):
+            couper = couper not in ("0", "false", "False")
+        else:
+            couper = bool(couper)
         try:
             duree = float(donnees.get("duree", studio.DUREE_DEFAUT))
         except (TypeError, ValueError) as exc:
@@ -544,20 +624,39 @@ class SiteStudio(BaseHTTPRequestHandler):
                 message="Le montage n'a pas pu être créé.",
             )
 
-    def _suivi(self, identifiant: str) -> None:
-        fiche = obtenir_travail(identifiant)
-        if not fiche:
-            self._erreur(404, "Montage introuvable.")
-            return
+    def _reponse_travail(self, identifiant: str, fiche: dict) -> None:
         self._json(200, {
+            "id": identifiant,
             "etat": fiche.get("etat", ""),
             "message": fiche.get("message", ""),
             "nom": fiche.get("nom", ""),
             "erreur": fiche.get("erreur", ""),
         })
 
+    def _dernier(self) -> None:
+        fiche, ident = travail_recent()
+        if not fiche:
+            self._erreur(404, "Montage introuvable.")
+            return
+        self._reponse_travail(ident, fiche)
+
+    def _suivi(self, identifiant: str) -> None:
+        fiche = obtenir_travail(identifiant)
+        ident = identifiant_sur(identifiant)
+        if not fiche:
+            print(f"montage absent: {identifiant!r}", flush=True)
+            fiche, ident = travail_recent()
+        if not fiche:
+            self._erreur(404, "Montage introuvable.")
+            return
+        self._reponse_travail(ident, fiche)
+
     def _video(self, identifiant: str) -> None:
         fiche = obtenir_travail(identifiant)
+        if not fiche or not fiche.get("video"):
+            recent, _ident = travail_recent()
+            if recent and recent.get("video"):
+                fiche = recent
         chemin = fiche.get("video", "") if fiche else ""
         nom = fiche.get("nom", "") if fiche else ""
         if not chemin or not os.path.isfile(chemin) or not dans_depot(chemin):

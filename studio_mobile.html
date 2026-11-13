@@ -707,7 +707,8 @@
       const attente = async () => {
         let reponse;
         try {
-          reponse = await fetch("/api/montage/" + id);
+          reponse = await fetch("/api/montage/" + encodeURIComponent(id));
+          if (reponse.status === 404) reponse = await fetch("/api/montage/dernier");
         } catch (exc) {
           if (essais < 8) {
             essais += 1;
@@ -732,7 +733,8 @@
         essais = 0;
         $("statut").textContent = donnees.message || "Montage en cours…";
         if (donnees.etat === "pret") {
-          const url = "/api/video/" + id;
+          const ident = donnees.id || id;
+          const url = "/api/video/" + ident;
           apercu.src = url;
           apercu.dataset.cle = "resultat";
           apercu.controls = true;
@@ -787,18 +789,28 @@
         }
         $("statut").textContent = "Encodage du montage…";
         const phrases = $("phrases").value.split("\n");
-        const reponse = await lireJson(await fetch("/api/montage", {
+        const charge = {
+          clips: ids,
+          phrases,
+          duree: Number(duree.value),
+          couper: etat.couper,
+          theme_image: etat.image,
+          theme_texte: etat.texte,
+          filigrane: $("filigrane").value,
+        };
+        const params = new URLSearchParams({
+          clips: ids.join(","),
+          phrases: phrases.join("\n"),
+          duree: String(charge.duree),
+          couper: etat.couper ? "1" : "0",
+          theme_image: etat.image,
+          theme_texte: etat.texte,
+          filigrane: $("filigrane").value,
+        });
+        const reponse = await lireJson(await fetch("/api/montage/?" + params.toString(), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            clips: ids,
-            phrases,
-            duree: Number(duree.value),
-            couper: etat.couper,
-            theme_image: etat.image,
-            theme_texte: etat.texte,
-            filigrane: $("filigrane").value,
-          }),
+          body: JSON.stringify(charge),
         }));
         await suivre(reponse.id);
       } catch (exc) {
